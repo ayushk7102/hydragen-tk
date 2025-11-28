@@ -17,6 +17,7 @@ from einops import rearrange
 import triton
 import triton.language as tl
 
+from .attention_tk import tk_simple_attention
 
 def combine_lse_torch(
     outs: list[Tensor],
