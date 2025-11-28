@@ -1,6 +1,24 @@
 import torch
 import thunderkittens as tk
 
+def can_use_tk(q_len: int, k_len: int, head_dim: int) -> bool:
+    """
+    Determines if the ThunderKittens H100 kernel can handle this specific request.
+    
+    Constraints:
+    1. Shape Matching: Q and K must have same length (Kernel is Self-Attention only).
+    2. Head Dimension: Must be 64 or 128 (Kernel hardcoded limits).
+    3. Alignment: Sequence length must be a multiple of 192 (Kernel grid size logic).
+    4. Minimum Length: We set a safe floor of 192 to ensure pipeline stability.
+    """
+    # Self-Attention Check
+    if q_len != k_len:
+        return False
+        
+    return (head_dim in [64, 128]) and (q_len >= 192) and (q_len % 192 == 0)
+
+
+# Note: Can use only if seqlen is a multiple of 192 (block size).
 def tk_simple_attention(q, k, v, is_causal=False):
     """
     Adapter to make ThunderKittens H100 kernel compatible with Hydragen.
@@ -12,6 +30,8 @@ def tk_simple_attention(q, k, v, is_causal=False):
         out: [Batch, Seq, Heads, Dim]
         lse: [Batch, Seq, Heads]
     """
+    # print(f">> ThunderKittens Kernel Triggered! Shape: {q.shape}") 
+
     # 1. Capture original dtype to cast output back later (Hydragen uses float16)
     orig_dtype = q.dtype
 

@@ -1,8 +1,6 @@
 from transformers.models.llama.modeling_llama import (
     LlamaMLP,
     LlamaRotaryEmbedding,
-    LlamaLinearScalingRotaryEmbedding,
-    LlamaDynamicNTKScalingRotaryEmbedding,
     LlamaRMSNorm,
     apply_rotary_pos_emb,
     LlamaConfig,
@@ -11,6 +9,7 @@ from transformers.models.llama.modeling_llama import (
 
 from einops import rearrange
 
+from hydragen.attention_tk import tk_simple_attention, can_use_tk
 import torch
 from torch import nn, Tensor
 import os
@@ -23,7 +22,7 @@ from hydragen.attention import (
     hydragen_attention,
 )
 
-from hydragen.flash import flash_attention, flash_attention_seqlen
+# from hydragen.flash import flash_attention, flash_attention_seqlen
 
 from dataclasses import dataclass
 from accelerate import init_empty_weights
@@ -44,15 +43,33 @@ def repeat_to_batch_size(tensors: list[Tensor], target_batch_size: int | None = 
     return repeated_tensors
 
 
-class HydragenLlamaRotaryEmbedding(LlamaRotaryEmbedding):
-    cos_cached: Tensor
-    sin_cached: Tensor
 
-    def forward(self, x: Tensor, seq_len=None):
+class HydragenLlamaRotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32).float().to(device) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(seq_len=max_position_embeddings, device=device, dtype=torch.get_default_dtype())
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
         return (
-            self.cos_cached.to(dtype=x.dtype),
-            self.sin_cached.to(dtype=x.dtype),
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
+
 
 
 class SharedCache(nn.Module):
@@ -506,7 +523,15 @@ class HydragenLlamaAttention(nn.Module):
         elif self.mode == AttentionMode.SHARED_PREFILL:
             if not self.kv_cache.has_shared():
 
-                attn_output, _ = flash_attention(
+                # TK PATCH START
+                use_tk = False
+                if query_states.shape[1] == key_states.shape[1]:
+                    use_tk = can_use_tk(query_states.shape[1], key_states.shape[1], self.head_dim)
+                if use_tk:
+                    attn_output, _ = tk_simple_attention(query_states, key_states, value_states, is_causal=True)
+                else:
+                    # TK PATCH END
+                    attn_output, _ = flash_attention(
                     query_states, key_states, value_states, causal=True
                 )
 
@@ -534,7 +559,15 @@ class HydragenLlamaAttention(nn.Module):
                 # Note the slicing is needed so that there is no zero padding for the
                 # decoded tokens in the key/value status. This will not work for shared
                 # caches with batch size > 1 where the sequence length differs.
-                attn_output, _ = flash_attention(
+                # TK PATCH START
+                use_tk = False
+                if query_states.shape[1] == key_states.shape[1]:
+                    use_tk = can_use_tk(query_states.shape[1], key_states.shape[1], self.head_dim)
+                if use_tk:
+                    attn_output, _ = tk_simple_attention(query_states, key_states, value_states, is_causal=True)
+                else:
+                    # TK PATCH END
+                    attn_output, _ = flash_attention(
                     query_states,
                     key_states[:, : (unique_position_ids.max().item() + 1)],
                     value_states[:, : (unique_position_ids.max().item() + 1)],
@@ -543,7 +576,15 @@ class HydragenLlamaAttention(nn.Module):
 
             else:
                 if not self.kv_cache.has_shared():
-                    attn_output, _ = flash_attention(
+                    # TK PATCH START
+                    use_tk = False
+                    if query_states.shape[1] == key_states.shape[1]:
+                        use_tk = can_use_tk(query_states.shape[1], key_states.shape[1], self.head_dim)
+                    if use_tk:
+                        attn_output, _ = tk_simple_attention(query_states, key_states, value_states, is_causal=True)
+                    else:
+                        # TK PATCH END
+                        attn_output, _ = flash_attention(
                         query_states, key_states, value_states, causal=True
                     )
 
@@ -724,19 +765,9 @@ class HydragenLlamaModel(nn.Module):
             scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
             if scaling_type == "linear":
-                self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
-                    self.config.hidden_size // self.config.num_attention_heads,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
+                self.rotary_emb = HydragenLlamaRotaryEmbedding(self.config.hidden_size // self.config.num_attention_heads, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta, scaling_factor=scaling_factor)
             elif scaling_type == "dynamic":
-                self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
-                    self.config.hidden_size // self.config.num_attention_heads,
-                    max_position_embeddings=self.max_position_embeddings,
-                    scaling_factor=scaling_factor,
-                    base=self.rope_theta,
-                )
+                self.rotary_emb = HydragenLlamaRotaryEmbedding(self.config.hidden_size // self.config.num_attention_heads, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta, scaling_factor=scaling_factor)
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
 

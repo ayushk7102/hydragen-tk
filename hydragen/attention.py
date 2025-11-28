@@ -7,18 +7,42 @@ from torch import Tensor
 
 from typing import Optional, List
 
-from hydragen.flash import (
-    flash_attention,
-    flash_attention_varlen,
-    flash_attention_seqlen,
-)
+# from hydragen.flash import (
+#     flash_attention,
+#     flash_attention_varlen,
+#     flash_attention_seqlen,
+# )
 from einops import rearrange
 
 import triton
 import triton.language as tl
 
-from .attention_tk import tk_simple_attention
+from .attention_tk import tk_simple_attention, can_use_tk
 
+# Try importing, but fail gracefully if missing
+try:
+    import flash_attn
+    from flash_attn.flash_attn_interface import (
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
+except ImportError:
+    # Dummy mocks to allow code to load without crashing
+    def flash_attn_func(*args, **kwargs):
+        raise NotImplementedError("FlashAttention is not installed.")
+    
+    def flash_attn_varlen_func(*args, **kwargs):
+        raise NotImplementedError("FlashAttention is not installed.")
+
+def flash_attention(q, k, v, causal=False):
+    # This wrapper allows the rest of Hydragen to import successfully
+    return flash_attn_func(q, k, v, causal=causal)
+
+def flash_attention_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=False):
+    return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, causal=causal)
+
+def flash_attention_seqlen(q, k, v, seq_len):
+    raise NotImplementedError("FlashAttention is not installed.")
 def combine_lse_torch(
     outs: list[Tensor],
     lses: list[Tensor],
@@ -354,6 +378,147 @@ def hydragen_attention(
 
     return aggregated
 
+
+def hydragen_attention_tk(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    shared_ks: list[Tensor],
+    shared_vs: list[Tensor],
+    shared_cu_seq_lens: list[Tensor | None],
+    shared_max_seq_lens: list[int | None],
+    use_varlens: list[bool],
+    seq_lens: Tensor | None = None,
+):
+    """
+    Computes Hydragen attention using TK kernel, when shapes allow
+
+    """
+
+    assert q.ndim == 4, f"{q.shape}"
+    assert k.ndim == 4, f"{k.shape}"
+    assert v.ndim == 4, f"{v.shape}"
+
+    assert k.shape == v.shape
+    assert (
+        len(shared_ks)
+        == len(shared_vs)
+        == len(shared_cu_seq_lens)
+        == len(shared_max_seq_lens)
+        == len(use_varlens)
+    )
+
+    b, nq, hq, d = q.shape
+    outs, lses = [], []
+
+    # --- Part 1: Shared Prefixes ---
+    for sk, sv, scu, smax, use_varlen in zip(
+        shared_ks, shared_vs, shared_cu_seq_lens, shared_max_seq_lens, use_varlens
+    ):
+        if not use_varlen:
+            # Calculate batched_q first so we know its length
+            num_shared_sequences = sk.shape[0]
+            batched_q = rearrange(
+                q,
+                "(num_shared_seq seq_per_shared) nq hq d -> num_shared_seq (seq_per_shared nq) hq d",
+                num_shared_seq=num_shared_sequences,
+            )
+
+            # Check if we can use the ThunderKittens kernel
+            use_tk = can_use_tk(batched_q.shape[1], sk.shape[1], d)
+          
+            batched_q = rearrange(
+                q,
+                "(num_shared_seq seq_per_shared) nq hq d -> num_shared_seq (seq_per_shared nq) hq d",
+                num_shared_seq=num_shared_sequences,
+            )
+
+            if use_tk:
+                # Optimized Path (TK)
+                shared_out, shared_lse = tk_simple_attention(batched_q, sk, sv, is_causal=False)
+                
+                # TK Adapter returns LSE as [Batch, Seq, Heads], which matches our target rearrangement below
+                # No extra transposition needed for LSE here.
+            else:
+                # Standard Path (FlashAttn)
+                shared_out, shared_lse = flash_attention(batched_q, sk, sv)
+                # FlashAttn returns LSE as [Batch, Heads, Seq], we must transpose to [Batch, Seq, Heads]
+                shared_lse = rearrange(shared_lse, "b h s -> b s h")
+
+            shared_out = shared_out.view(b, nq, hq, d)
+            
+            if k.shape[1] == 0 and len(shared_ks) == 1:
+                return shared_out
+
+            # Flatten batch/seq dims for combine_lse compatibility
+            shared_lse = rearrange(
+                shared_lse,
+                "num_shared_seq (seq_per_shared nq) h -> (num_shared_seq seq_per_shared) nq h",
+                nq=nq,
+            ).contiguous()
+
+        else:
+            # Varlen Path (Always FlashAttn)
+            num_shared_sequences = scu.shape[0] - 1
+            sequences_per_shared = b // num_shared_sequences
+            queries_per_shared = sequences_per_shared * nq
+
+            batched_q = rearrange(q, "b nq hq d -> (b nq) hq d")
+
+            qlens_to_cumsum = torch.cat([
+                torch.zeros((1,), dtype=torch.int32, device=q.device),
+                torch.full((num_shared_sequences,), queries_per_shared, dtype=torch.int32, device=q.device),
+            ])
+            q_culens = qlens_to_cumsum.cumsum(0, dtype=torch.int32)
+
+            shared_out, shared_lse = flash_attention_varlen(
+                batched_q, sk, sv,
+                cu_seqlens_q=q_culens, cu_seqlens_k=scu,
+                max_seqlen_q=queries_per_shared, max_seqlen_k=smax,
+            )
+
+            shared_out = rearrange(
+                shared_out,
+                "(ngroups groupsize nq) hq d -> (ngroups groupsize) nq hq d",
+                ngroups=num_shared_sequences, groupsize=sequences_per_shared,
+            ).contiguous()
+
+            if k.shape[1] == 0 and len(shared_ks) == 1:
+                return shared_out
+
+            shared_lse = rearrange(
+                shared_lse,
+                "ngroups h (groupsize nq) -> (ngroups groupsize) nq h",
+                ngroups=num_shared_sequences, groupsize=sequences_per_shared,
+            ).contiguous()
+
+        outs.append(shared_out)
+        lses.append(shared_lse)
+
+    # --- Part 2: Unique Suffixes ---
+    if seq_lens is None:
+        # Check if we can use TK (e.g. long user prompt)
+        use_tk = can_use_tk(q.shape[1], k.shape[1], d)
+
+        if use_tk:
+            unique_out, unique_lse = tk_simple_attention(q, k, v, is_causal=True)
+            # TK already returns [B, S, H], which matches the target shape below
+        else:
+            unique_out, unique_lse = flash_attention(q, k, v, causal=True)
+            # FA returns [B, H, S], need to transpose
+            unique_lse = rearrange(unique_lse, "b h s -> b s h")
+            
+        # Ensure contiguous and named dims match expectation
+        unique_lse = unique_lse.contiguous()
+    else:
+        unique_out, unique_lse = flash_attention_seqlen(q, k, v, seq_len=seq_lens)
+
+    outs.append(unique_out)
+    lses.append(unique_lse)
+
+    aggregated = combine_lse(outs, lses, enable_triton=True)
+    return aggregated
+    
 
 def hydragen_attention_nopad(
     q: Tensor,
