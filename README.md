@@ -1,5 +1,9 @@
-# Hydragen
+# Hydragen-TK
 
+Fast TK kernels for Hydragen 
+
+Hydragen 
+=======
 This repo provides the accompanying code for [Hydragen: High-Throughput LLM Inference with Shared Prefixes](https://arxiv.org/abs/2402.05099). Our goal is to provide a simple and efficient implementation of the shared-prefix optimizations described in the paper, in the style of [gpt-fast](https://github.com/pytorch-labs/gpt-fast).
 
 Hydragen is an efficient, exact implementation of scaled-dot-product attention for batches of sequences that share common prefixes. Using a shared prefix is a common setting for LLM inference: few-shot examples can be reused across multiple problems, many candidate solutions can be sampled from a single prompt (e.g. AlphaCode, self-consistency), and chatbots may serve multiple users with the same system instructions. 
