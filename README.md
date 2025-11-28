@@ -2,6 +2,20 @@
 
 Fast TK kernels for Hydragen 
 
+============================================================                                  
+BENCHMARK: Hydragen w/ ThunderKittens (H100 Optimized)                                        
+============================================================                            
+Warming up...                                                                           
+Running 100 iterations...                                                                   
+                                                                                     
+Results:                                                                                 
+  Avg Latency: 0.8487 ms                                                                  
+  Est. Throughput: 91.09 TFLOPS                                                                
+============================================================                                   
+                                                                                              
+
+
+
 Hydragen 
 =======
 This repo provides the accompanying code for [Hydragen: High-Throughput LLM Inference with Shared Prefixes](https://arxiv.org/abs/2402.05099). Our goal is to provide a simple and efficient implementation of the shared-prefix optimizations described in the paper, in the style of [gpt-fast](https://github.com/pytorch-labs/gpt-fast).
