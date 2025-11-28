@@ -12,6 +12,18 @@ Results:
   Avg Latency: 0.8487 ms                                                                  
   Est. Throughput: 91.09 TFLOPS                                                                
 ============================================================                                   
+
+============================================================
+BENCHMARK: Hydragen w/ FlashAttention (Baseline)
+============================================================
+Configuration: B=16, S=768, H=16, D=128
+Warming up...
+Running 100 iterations...
+
+Results:
+  Avg Latency: 0.5919 ms
+  Est. Throughput: 130.62 TFLOPS
+============================================================
                                                                                               
 ```
 
